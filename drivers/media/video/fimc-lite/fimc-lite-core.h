@@ -156,7 +156,7 @@ static inline void flite_hw_get_int_src(struct flite_dev *dev, u32 *src)
 	*src &= FLITE_REG_CISTATUS_IRQ_MASK;
 }
 
-inline struct flite_fmt const *find_flite_format(struct
+struct flite_fmt const *find_flite_format(struct
 		v4l2_mbus_framefmt *mf);
 /* fimc-reg.c */
 void flite_hw_set_cam_source_size(struct flite_dev *dev);
