@@ -34,6 +34,8 @@
 #include <linux/slab.h>
 #include <linux/atomic.h>
 
+/* #define  USE_INTERRUPT */
+
 /* Commands */
 #define SHT15_MEASURE_TEMP		0x03
 #define SHT15_MEASURE_RH		0x05
@@ -58,6 +60,11 @@ enum sht15_state {
 	SHT15_READING_NOTHING,
 	SHT15_READING_TEMP,
 	SHT15_READING_HUMID
+};
+
+enum sht15_type {
+	SHT15_TEMP,
+	SHT15_HUMID
 };
 
 /**
@@ -154,6 +161,7 @@ struct sht15_data {
 	bool				checksum_ok;
 	bool				checksumming;
 	enum sht15_state		state;
+	enum sht15_type		type;
 	bool				measurements_valid;
 	bool				status_valid;
 	unsigned long			last_measurement;
@@ -290,6 +298,7 @@ static void sht15_send_byte(struct sht15_data *data, u8 byte)
  */
 static int sht15_wait_for_response(struct sht15_data *data)
 {
+    gpio_set_value(data->pdata->gpio_data, 1);
 	gpio_direction_input(data->pdata->gpio_data);
 	gpio_set_value(data->pdata->gpio_sck, 1);
 	ndelay(SHT15_TSCKH);
@@ -507,22 +516,37 @@ static int sht15_measurement(struct sht15_data *data,
 	ret = sht15_send_cmd(data, command);
 	if (ret)
 		return ret;
+#ifdef USE_INTERRUPT
+    enable_irq(gpio_to_irq(data->pdata->gpio_data));
+#endif
+
+    if (data->type == SHT15_HUMID)
+        msleep(120);
+    else
+        msleep(300);
 
 	gpio_direction_input(data->pdata->gpio_data);
 	atomic_set(&data->interrupt_handled, 0);
 
-	enable_irq(gpio_to_irq(data->pdata->gpio_data));
 	if (gpio_get_value(data->pdata->gpio_data) == 0) {
 		disable_irq_nosync(gpio_to_irq(data->pdata->gpio_data));
+#ifdef USE_INTERRUPT
 		/* Only relevant if the interrupt hasn't occurred. */
 		if (!atomic_read(&data->interrupt_handled))
 			schedule_work(&data->read_work);
+#else
+        schedule_work(&data->read_work);
+#endif
+
 	}
+
 	ret = wait_event_timeout(data->wait_queue,
 				 (data->state == SHT15_READING_NOTHING),
 				 msecs_to_jiffies(timeout_msecs));
 	if (ret == 0) {/* timeout occurred */
+#ifdef USE_INTERRUPT
 		disable_irq_nosync(gpio_to_irq(data->pdata->gpio_data));
+#endif
 		sht15_connection_reset(data);
 		return -ETIME;
 	}
@@ -546,6 +570,7 @@ static int sht15_measurement(struct sht15_data *data,
 				return ret;
 			}
 		}
+        dev_err(data->dev, "try again\r\n");
 		return -EAGAIN;
 	}
 
@@ -564,14 +589,19 @@ static int sht15_update_measurements(struct sht15_data *data)
 	mutex_lock(&data->read_lock);
 	if (time_after(jiffies, data->last_measurement + timeout)
 	    || !data->measurements_valid) {
-		data->state = SHT15_READING_HUMID;
-		ret = sht15_measurement(data, SHT15_MEASURE_RH, 160);
-		if (ret)
-			goto error_ret;
-		data->state = SHT15_READING_TEMP;
-		ret = sht15_measurement(data, SHT15_MEASURE_TEMP, 400);
-		if (ret)
-			goto error_ret;
+
+        if (data->type == SHT15_HUMID) {
+            data->state = SHT15_READING_HUMID;
+            ret = sht15_measurement(data, SHT15_MEASURE_RH, 160);
+            if (ret)
+                goto error_ret;
+        } else {
+            data->state = SHT15_READING_TEMP;
+            ret = sht15_measurement(data, SHT15_MEASURE_TEMP, 400);
+            if (ret)
+                goto error_ret;
+        }
+
 		data->measurements_valid = true;
 		data->last_measurement = jiffies;
 	}
@@ -714,8 +744,8 @@ static ssize_t sht15_show_temp(struct device *dev,
 {
 	int ret;
 	struct sht15_data *data = dev_get_drvdata(dev);
-
 	/* Technically no need to read humidity as well */
+    data->type = SHT15_TEMP;
 	ret = sht15_update_measurements(data);
 
 	return ret ? ret : sprintf(buf, "%d\n",
@@ -738,6 +768,7 @@ static ssize_t sht15_show_humidity(struct device *dev,
 	int ret;
 	struct sht15_data *data = dev_get_drvdata(dev);
 
+    data->type = SHT15_HUMID;
 	ret = sht15_update_measurements(data);
 
 	return ret ? ret : sprintf(buf, "%d\n", sht15_calc_humid(data));
@@ -776,10 +807,10 @@ static const struct attribute_group sht15_attr_group = {
 	.attrs = sht15_attrs,
 };
 
+#ifdef USE_INTERRUPT
 static irqreturn_t sht15_interrupt_fired(int irq, void *d)
 {
 	struct sht15_data *data = d;
-
 	/* First disable the interrupt */
 	disable_irq_nosync(irq);
 	atomic_inc(&data->interrupt_handled);
@@ -788,6 +819,7 @@ static irqreturn_t sht15_interrupt_fired(int irq, void *d)
 		schedule_work(&data->read_work);
 	return IRQ_HANDLED;
 }
+#endif
 
 static void sht15_bh_read_data(struct work_struct *work_s)
 {
@@ -805,7 +837,11 @@ static void sht15_bh_read_data(struct work_struct *work_s)
 		 * have gone low in meantime so verify it hasn't!
 		 */
 		atomic_set(&data->interrupt_handled, 0);
+
+#ifdef USE_INTERRUPT
 		enable_irq(gpio_to_irq(data->pdata->gpio_data));
+#endif
+
 		/* If still not occurred or another handler was scheduled */
 		if (gpio_get_value(data->pdata->gpio_data)
 		    || atomic_read(&data->interrupt_handled))
@@ -835,7 +871,6 @@ static void sht15_bh_read_data(struct work_struct *work_s)
 
 	/* Tell the device we are done */
 	sht15_end_transmission(data);
-
 	switch (data->state) {
 	case SHT15_READING_TEMP:
 		data->val_temp = val;
@@ -873,7 +908,6 @@ static int sht15_invalidate_voltage(struct notifier_block *nb,
 				    void *ignored)
 {
 	struct sht15_data *data = container_of(nb, struct sht15_data, nb);
-
 	if (event == REGULATOR_EVENT_VOLTAGE_CHANGE)
 		data->supply_uV_valid = false;
 	schedule_work(&data->update_supply_work);
@@ -950,15 +984,16 @@ static int __devinit sht15_probe(struct platform_device *pdev)
 	}
 	gpio_direction_output(data->pdata->gpio_sck, 0);
 
+
 	ret = gpio_request(data->pdata->gpio_data, "SHT15 data");
 	if (ret) {
 		dev_err(&pdev->dev, "gpio request failed\n");
 		goto err_release_gpio_sck;
 	}
-
+#ifdef USE_INTERRUPT
 	ret = request_irq(gpio_to_irq(data->pdata->gpio_data),
 			  sht15_interrupt_fired,
-			  IRQF_TRIGGER_FALLING,
+              IRQF_TRIGGER_FALLING,
 			  "sht15 data",
 			  data);
 	if (ret) {
@@ -966,6 +1001,8 @@ static int __devinit sht15_probe(struct platform_device *pdev)
 		goto err_release_gpio_data;
 	}
 	disable_irq_nosync(gpio_to_irq(data->pdata->gpio_data));
+#endif
+
 	sht15_connection_reset(data);
 	ret = sht15_soft_reset(data);
 	if (ret)
@@ -994,12 +1031,18 @@ static int __devinit sht15_probe(struct platform_device *pdev)
 
 err_release_sysfs_group:
 	sysfs_remove_group(&pdev->dev.kobj, &sht15_attr_group);
+
 err_release_irq:
+#ifdef USE_INTERRUPT
 	free_irq(gpio_to_irq(data->pdata->gpio_data), data);
 err_release_gpio_data:
 	gpio_free(data->pdata->gpio_data);
+#else
+    gpio_free(data->pdata->gpio_data);
+#endif
 err_release_gpio_sck:
 	gpio_free(data->pdata->gpio_sck);
+
 err_release_reg:
 	if (!IS_ERR(data->reg)) {
 		regulator_unregister_notifier(data->reg, &data->nb);
@@ -1032,8 +1075,9 @@ static int __devexit sht15_remove(struct platform_device *pdev)
 		regulator_disable(data->reg);
 		regulator_put(data->reg);
 	}
-
+#ifdef USE_INTERRUPT
 	free_irq(gpio_to_irq(data->pdata->gpio_data), data);
+#endif
 	gpio_free(data->pdata->gpio_data);
 	gpio_free(data->pdata->gpio_sck);
 	mutex_unlock(&data->read_lock);

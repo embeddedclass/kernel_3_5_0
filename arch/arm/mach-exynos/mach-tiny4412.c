@@ -33,6 +33,7 @@
 #include <linux/platform_data/exynos_thermal.h>
 #include <linux/mfd/s5m87xx/s5m-pmic.h>
 #include <linux/mfd/s5m87xx/s5m-core.h>
+#include <linux/sht15.h>
 
 #include <asm/mach/arch.h>
 #include <asm/hardware/gic.h>
@@ -97,6 +98,25 @@
 
 
 static struct max77686_regulator_data max77686_regulators[MAX77686_REG_MAX];
+
+/*
+ * use tiny4412SDK 1506
+ * XEINT8    : GPX1[0]/XEINT_8  : GPIO9 --> SDA
+ * XspiCSn_1 : GPB[5]/SPI_1_nSS : GPIO6 --> SCK
+ */
+
+static struct sht15_platform_data platform_data_sht15 = {
+	.gpio_data =  EXYNOS4_GPX1(0),
+	.gpio_sck  =  EXYNOS4_GPB(5),
+};
+
+static struct platform_device sht15 = {
+	.name = "sht15",
+	.id = -1,
+	.dev = {
+		.platform_data = &platform_data_sht15,
+	},
+};
 
 static struct s3c2410_uartcfg smdk4x12_uartcfgs[] __initdata = {
 	[0] = {
@@ -1838,7 +1858,7 @@ static struct platform_device *smdk4x12_devices[] __initdata = {
 	&exynos_device_dwmci,
 #endif
 	&my_button_device,
-
+    &sht15,
 	&s3c_device_hsmmc2,
 	&s3c_device_hsmmc3,
 	&wm8994_fixed_voltage0,
